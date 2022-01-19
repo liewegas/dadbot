@@ -177,7 +177,7 @@ class Dadbot:
                 self.send_to_subs(f'Idle for {to_pretty_timedelta(idle)}')
             self.last_idle = idle
             
-            time.sleep(5)
+            time.sleep(60)
         log.info('main exit')
 
     def start(self):
