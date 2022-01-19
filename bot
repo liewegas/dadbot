@@ -158,7 +158,7 @@ class Dadbot:
                 'You are %s' % who
             )
 
-        elif cmd == 'help':
+        elif who is self.subs and cmd == 'help':
             self.send_message(
                 who,
                 's or status -- current status\n'
