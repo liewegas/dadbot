@@ -137,6 +137,7 @@ class Dadbot:
         elif cmd and cmd.split()[0] == 'max':
             try:
                 self.max_idle = from_pretty(cmd.split()[1])
+                self.save_subs()
                 self.send_to_subs(
                     f'New max idle is {to_pretty_timedelta(self.max_idle)}, set by {who}'
                 )
