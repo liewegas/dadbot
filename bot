@@ -87,6 +87,9 @@ class Dadbot:
         with open('subs.txt', 'w') as f:
             f.write('\n'.join(self.subs) + '\n')
             f.close()
+        with open('max_idle.txt', 'w') as f:
+            f.write(str(self.max_idle) + '\n')
+            f.close()
 
     def send_subs(self, who):
         what = []
