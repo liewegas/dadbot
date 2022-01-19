@@ -98,7 +98,7 @@ class Dadbot:
         )
 
     def get_idle_time(self):
-        out = subprocess.check_output('xprintidle')
+        out = subprocess.check_output('DISPLAY=:0 xprintidle', shell=True)
         idle = int(out) / 1000.0
         log.debug(f'....Idle is {idle}')
         return idle

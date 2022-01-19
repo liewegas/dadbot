@@ -7,3 +7,5 @@ Wants=network-online.target local-fs.target time-sync.target
 ExecStart=/home/sam/src/dadbot/run
 Restart=on-failure
 RestartSec=10s
+User=sam
+Group=sam
