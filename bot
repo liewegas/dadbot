@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+
+import argparse
+import datetime
+import os
+import time
+import logging
+import requests
+import subprocess
+import threading
+import time
+
+from dotenv import load_dotenv
+from flask import Flask, request
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse, Message
+
+log = logging.getLogger('dadbot')
+
+load_dotenv()
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
+
+def from_pretty(s: str) -> int:
+    s = s.strip()
+    if not s[-1].isdigit():
+        unit = s[-1]
+        v = int(s[0:-1])
+        if unit == 's':
+            pass
+        elif unit == 'm':
+            v *= 60
+        elif unit == 'h':
+            v *= 60*60
+        elif unit == 'd':
+            v *= 24*60*60
+        else:
+            raise ValueError(f'unrecognized unit "{unit}" from "{s}"')
+        return v
+    else:
+        return int(s)
+
+def to_pretty_timedelta(s: int) -> str:
+    n = datetime.timedelta(seconds=s)
+    if n < datetime.timedelta(seconds=120):
+        return str(n.seconds) + 's'
+    if n < datetime.timedelta(minutes=120):
+        return str(n.seconds // 60) + 'm'
+    if n < datetime.timedelta(hours=48):
+        return str(n.seconds // 3600) + 'h'
+    if n < datetime.timedelta(days=14):
+        return str(n.days) + 'd'
+    if n < datetime.timedelta(days=7*12):
+        return str(n.days // 7) + 'w'
+    if n < datetime.timedelta(days=365*2):
+        return str(n.days // 30) + 'M'
+    return str(n.days // 365) + 'y'
+
+
+class Dadbot:
+    def __init__(self):
+        self.client = None
+        self.last_idle = self.get_idle_time()
+        self.subs = set()
+
+        self.client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        self.load_subs()
+
+        self.bg = None
+        self._stop = True
+
+    def load_subs(self):
+        with open('subs.txt', 'r') as f:
+            for sub in f.read().split('\n'):
+                if sub:
+                    self.subs.add(sub)
+        log.info('Loaded subs: %s' % self.subs)
+
+        with open('max_idle.txt', 'r') as f:
+            self.max_idle = int(f.read())
+        log.info(f'Max idle: {self.max_idle}')
+
+    def save_subs(self):
+        with open('subs.txt', 'w') as f:
+            f.write('\n'.join(self.subs) + '\n')
+            f.close()
+
+    def send_subs(self, who):
+        what = []
+        if who in self.subs:
+            what.append('idle notifications')
+        self.send_message(
+            who,
+            f'You are subscribed to {" and ".join(what)}'
+        )
+
+    def get_idle_time(self):
+        out = subprocess.check_output('xprintidle')
+        idle = int(out) / 1000.0
+        log.debug(f'....Idle is {idle}')
+        return idle
+
+    def send_to_subs(self, message):
+        log.info(f'send_note {message}')
+        for s in self.subs:
+            self.send_message(s, message)
+    
+    def send_message(self, who, message):
+        log.info(f"send_message {who} '{message}'")
+        self.client.messages.create(body=message, from_=TWILIO_NUMBER, to=who)
+
+    def receive_message(self, who, message):
+        cmd = message.lower()
+        log.info(f'{who}: {cmd}')
+
+        if cmd == 'status' or cmd == 's':
+            idle = self.get_idle_time()
+            self.send_message(who, f'Idle for {to_pretty_timedelta(idle)}\nNotify at {to_pretty_timedelta(self.max_idle)}\n')
+
+        elif cmd == 'sub':
+            self.subs.add(who)
+            self.save_subs()
+            self.send_subs(who)
+
+        elif cmd == 'unsub':
+            if who in self.subs:
+                self.subs.remove(who)
+            self.save_subs()
+            self.send_subs(who)
+
+        elif cmd and cmd.split()[0] == 'max':
+            try:
+                self.max_idle = from_pretty(cmd.split()[1])
+                self.send_to_subs(
+                    f'New max idle is {to_pretty_timedelta(self.max_idle)}, set by {who}'
+                )
+            except ValueError:
+                self.send_message(
+                    who,
+                    'Must send "max <idle_time>", e.g., "max 24h"'
+                )
+
+        elif cmd == 'who':
+            self.send_message(
+                who,
+                f"Subscribers: {list(self.subs).join(' ')}\n"
+            )
+        elif cmd == 'whoami':
+            self.send_message(
+                who,
+                'You are %s' % who
+            )
+
+        elif cmd == 'help':
+            self.send_message(
+                who,
+                's or status -- current status\n'
+                'sub -- subscribe\n'
+                'unsub -- unsubscribe\n'
+                'max <duration> -- adjust idle time to warn at (e.g., "max 24h")]\n'
+                'who -- see who (else) is subscribed\n'
+                'help -- this message\n'
+            )
+            
+    def do_main(self):
+        log.info('main start')
+        while not self._stop:
+            idle = self.get_idle_time()
+
+            if (
+                self.last_idle < self.max_idle
+                and idle > self.max_idle
+            ):
+                self.send_to_subs(f'Idle for {to_pretty_timedelta(idle)}')
+            self.last_idle = idle
+            
+            time.sleep(5)
+        log.info('main exit')
+
+    def start(self):
+        log.info('start')
+        assert not self.bg
+        assert self._stop
+        self.bg = threading.Thread(target=dadbot.do_main, args=())
+        self._stop = False
+        self.bg.start()
+
+    def stop(self):
+        log.info('stop')
+        assert not self._stop
+        assert self.bg
+        self._stop = True
+        self.bg.join()
+        self.bg = None
+
+
+###########
+
+dadbot = Dadbot()
+app = Flask(__name__)
+
+@app.route('/sms', methods=['POST'])
+def inbound_sms():
+    who = request.form['From']
+    body = request.form['Body']
+    dadbot.receive_message(who, body)
+    response = MessagingResponse()
+    return str(response)
+
+def _get_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '-d', '--debug', action='store_true',
+        help='log detailed debugging messages'
+    )
+    return parser
+
+if __name__ == '__main__':
+    log.info('main start')
+    args = _get_parser().parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+
+    dadbot.start()
+    app.run(host='0.0.0.0', debug=True, use_reloader=False)
+    dadbot.stop()
+
+    log.info('main end')
