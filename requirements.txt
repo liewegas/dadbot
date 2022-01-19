@@ -2,4 +2,3 @@ twilio
 requests
 flask
 python-dotenv
-subprocess
