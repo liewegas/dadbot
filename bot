@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import time
 import logging
@@ -10,10 +11,13 @@ import subprocess
 import threading
 import time
 
+from dateutil import parser
 from dotenv import load_dotenv
+from enum import Enum
 from flask import Flask, request
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse, Message
+
 
 log = logging.getLogger('dadbot')
 
@@ -22,6 +26,15 @@ load_dotenv()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
+URL = os.getenv("DADBOT_URL", "")
+SLEEP = int(os.getenv("DADBOT_SLEEP", "60"))
+
+
+class BotState(Enum):
+    OK = 1
+    IDLE = 2
+    STALE =3
+
 
 def from_pretty(s: str) -> int:
     s = s.strip()
@@ -61,35 +74,44 @@ def to_pretty_timedelta(s: int) -> str:
 
 class Dadbot:
     def __init__(self):
-        self.client = None
-        self.last_idle = self.get_idle_time()
-        self.subs = set()
-
         self.client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-        self.load_subs()
+        self.load()
+        self.state = BotState.OK
+
+        self.agent = (URL != "")
 
         self.bg = None
         self._stop = True
 
-    def load_subs(self):
-        with open('subs.txt', 'r') as f:
-            for sub in f.read().split('\n'):
-                if sub:
-                    self.subs.add(sub)
-        log.info('Loaded subs: %s' % self.subs)
+    def load(self):
+        with open('state.json', 'r') as f:
+            try:
+                s = json.loads(f.read())
+            except json.decoder.JSONDecodeError:
+                s = {}
+            log.info("Load: {s}")
+            self.subs = s.get('subs', [])
+            self.max_idle = s.get('max_idle', 24*60*60)
+            try:
+                self.idle_since = parser.isoparse(s.get('idle_since', ''))
+            except ValueError:
+                self.idle_since = datetime.datetime.utcnow()
+            try:
+                self.last_update = parser.isoparse(s.get('last_update', ''))
+            except ValueError:
+                self.last_update = datetime.datetime.utcnow()
 
-        with open('max_idle.txt', 'r') as f:
-            self.max_idle = int(f.read())
-        log.info(f'Max idle: {self.max_idle}')
-
-    def save_subs(self):
-        with open('subs.txt', 'w') as f:
-            f.write('\n'.join(self.subs) + '\n')
-            f.close()
-        with open('max_idle.txt', 'w') as f:
-            f.write(str(self.max_idle) + '\n')
-            f.close()
+    def save(self):
+        with open('state.json.new', 'w') as f:
+            f.write(json.dumps({
+                'subs': self.subs,
+                'max_idle': self.max_idle,
+                'idle_since': self.idle_since.isoformat(),
+                'last_update': self.last_update.isoformat(),
+            }))
+            os.fsync(f.fileno())
+        os.rename('state.json.new', 'state.json')
 
     def send_subs(self, who):
         what = []
@@ -120,24 +142,25 @@ class Dadbot:
         log.info(f'{who}: {cmd}')
 
         if cmd == 'status' or cmd == 's':
-            idle = self.get_idle_time()
-            self.send_message(who, f'Idle for {to_pretty_timedelta(idle)}\nNotify at {to_pretty_timedelta(self.max_idle)}\n')
+            idle = (datetime.datetime.utcnow() - self.idle_since).total_seconds()
+            up = (datetime.datetime.utcnow() - self.last_update).total_seconds()
+            self.send_message(who, f'Idle for {to_pretty_timedelta(idle)} ({self.idle_since.isoformat()})\nLast update was {to_pretty_timedelta(up)} ago ({self.last_update.isoformat()})\nNotify at {to_pretty_timedelta(self.max_idle)}\n')
 
         elif cmd == 'sub':
             self.subs.add(who)
-            self.save_subs()
+            self.save()
             self.send_subs(who)
 
         elif cmd == 'unsub':
             if who in self.subs:
                 self.subs.remove(who)
-            self.save_subs()
+            self.save()
             self.send_subs(who)
 
         elif cmd and cmd.split()[0] == 'max':
             try:
                 self.max_idle = from_pretty(cmd.split()[1])
-                self.save_subs()
+                self.save()
                 self.send_to_subs(
                     f'New max idle is {to_pretty_timedelta(self.max_idle)}, set by {who}'
                 )
@@ -150,7 +173,7 @@ class Dadbot:
         elif cmd == 'who':
             self.send_message(
                 who,
-                f"Subscribers: {list(self.subs).join(' ')}\n"
+                f"Subscribers: {' '.join(self.subs)}\n"
             )
         elif cmd == 'whoami':
             self.send_message(
@@ -168,20 +191,47 @@ class Dadbot:
                 'who -- see who (else) is subscribed\n'
                 'help -- this message\n'
             )
-            
+
+    def got_update(self, idle_since):
+        log.info(f'got_update since {idle_since.isoformat()}')
+        self.idle_since = idle_since
+        self.last_update = datetime.datetime.utcnow()
+        self.save()
+
+    def get_state(self):
+        now = datetime.datetime.utcnow()
+        last_up = (now - self.last_update).total_seconds()
+        idle = (now - self.idle_since).total_seconds()
+        if last_up > self.max_idle:
+            return BotState.STALE, f'No update for {to_pretty_timedelta(last_up)} (since {self.last_update.isoformat()})'
+        elif idle > self.max_idle:
+            return BotState.IDLE, f'Idle for {to_pretty_timedelta(idle)} (since {self.idle_since.isoformat()})'
+        else:
+            return BotState.OK, f'Recently active, idle for {to_pretty_timedelta(idle)}'
+
     def do_main(self):
         log.info('main start')
-        while not self._stop:
-            idle = self.get_idle_time()
 
-            if (
-                self.last_idle < self.max_idle
-                and idle > self.max_idle
-            ):
-                self.send_to_subs(f'Idle for {to_pretty_timedelta(idle)}')
-            self.last_idle = idle
-            
-            time.sleep(60)
+        while not self._stop:
+            if self.agent:
+                idle = self.get_idle_time()
+                try:
+                    response = requests.get(
+                        URL,
+                        params={
+                            'idle_seconds': int(idle),
+                        },
+                        timeout=5,
+                    )
+                except Exception as e:
+                    log.exception(e)
+            else:
+                new_state, msg = self.get_state()
+                if self.state != new_state:
+                    self.send_to_subs(msg)
+                    self.state = new_state
+
+            time.sleep(SLEEP)
         log.info('main exit')
 
     def start(self):
@@ -213,6 +263,18 @@ def inbound_sms():
     dadbot.receive_message(who, body)
     response = MessagingResponse()
     return str(response)
+
+@app.route('/update', methods=['GET'])
+def inbound_idle():
+    try:
+        idle_seconds = int(request.args.get('idle_seconds'))
+        idle_since = datetime.datetime.utcnow() - datetime.timedelta(
+            seconds=idle_seconds
+        )
+        dadbot.got_update(idle_since)
+    except ValueError:
+        log.warning("/update didn't get valid idle_seconds")
+    return ""
 
 def _get_parser():
     parser = argparse.ArgumentParser(
